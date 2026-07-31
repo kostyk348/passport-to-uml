@@ -109,7 +109,7 @@ The LLM agent would:
 
 ## License
 
-MIT
+Apache 2.0
 
 ## See Also
 
