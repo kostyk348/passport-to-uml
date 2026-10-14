@@ -14,3 +14,9 @@ Thumbs.db
 *.dot
 *.gv
 !examples/*.md
+out/
+ci-out/
+*.spec.md
+*.spec.csv
+*.links.csv
+.pytest_cache/

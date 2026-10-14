@@ -1,0 +1,53 @@
+name: tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # requires-python = ">=3.9"
+        python-version: ['3.9', '3.12', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Graphviz (для проверки рендера)
+        run: sudo apt-get update && sudo apt-get install -y graphviz
+
+      - name: Install package (с зависимостями PDF и Graphviz)
+        run: python -m pip install --upgrade pip pdfplumber graphviz
+
+      - name: Юнит-тесты (stdlib, без pytest)
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: Синтаксис всех модулей
+        run: python -m compileall -q passport_to_uml check_passports.py examples/build_passport_pdfs.py
+
+      - name: CLI на паспорте — DOT и таблица состава
+        run: |
+          python -m passport_to_uml \
+            "examples/passports/vendor_a_teplomash_blok-e_gost.txt" \
+            --outdir ci-out --no-render
+          test -s ci-out/vendor_a_teplomash_blok-e_gost.dot
+          test -s ci-out/vendor_a_teplomash_blok-e_gost.spec.md
+
+      - name: Проверка на трёх паспортах разных производителей (через PDF)
+        run: |
+          sudo apt-get install -y libreoffice-writer-nogui || sudo apt-get install -y libreoffice-writer
+          python examples/build_passport_pdfs.py
+          python check_passports.py examples/passports/pdf/*.pdf --outdir ci-out
+
+      - name: Бюджет кода и артефакты CI
+        if: always()
+        run: ls -la ci-out || true

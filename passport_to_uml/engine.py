@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-passport-to-uml engine v1.1 — generic electrical/control equipment parser.
+passport-to-uml engine v1.2 — generic electrical/control equipment parser.
 
 Pipeline:
-  1. Extract text from PDF (pdfplumber)
+  1. Extract text from PDF / text / HTML (passport_to_uml.sources)
   2. Sectionize — split by numbered headers
   3. Extract components — pattern match names from lists and descriptions
   4. Extract relations — connections from terminal assignments and flow text
   5. Group by subsystem
-  6. Build graph → Graphviz DOT → PNG + PDF
+  6. Build graph → Graphviz DOT (stdlib) → PNG + PDF (Graphviz, если есть)
+  7. Таблица состава: <stem>.spec.md / <stem>.spec.csv / <stem>.links.csv
 """
 
 import sys
@@ -18,6 +19,8 @@ import json
 import logging
 from collections import defaultdict, OrderedDict
 from pathlib import Path
+
+__version__ = '1.2.0'
 
 log = logging.getLogger(__name__)
 
@@ -332,6 +335,7 @@ class SystemModel:
         self.relations = []
         self.groups = OrderedDict()
         self.flow_notes = []
+        self.dropped_relations = []
         self.title = ''
         self.subtitle = ''
 
@@ -352,6 +356,15 @@ class SystemModel:
         return comp
 
     def relate(self, from_name, to_name, label=''):
+        """Добавить связь ``from_name → to_name``.
+
+        Возвращает ``True``, если связь добавлена или обновлена, и ``False``,
+        если ребро отброшено: один из концов не зарегистрирован как компонент.
+
+        Отброшенное ребро НЕ теряется молча — оно попадает в
+        ``self.dropped_relations`` (и в лог), а затем в таблицу состава
+        с пометкой «отброшена» и причиной.
+        """
         f_id = _name_to_id(from_name)
         t_id = _name_to_id(to_name)
         if f_id in self.components and t_id in self.components:
@@ -359,8 +372,25 @@ class SystemModel:
                 if r.from_id == f_id and r.to_id == t_id:
                     if label and label not in r.label:
                         r.label += ' / ' + label
-                    return
+                    return True
             self.relations.append(Relation(f_id, t_id, label))
+            return True
+
+        unknown = []
+        if f_id not in self.components:
+            unknown.append(f'откуда «{from_name}»')
+        if t_id not in self.components:
+            unknown.append(f'куда «{to_name}»')
+        reason = 'узел не зарегистрирован в модели: ' + ', '.join(unknown)
+        self.dropped_relations.append({
+            'from': from_name,
+            'to': to_name,
+            'label': label,
+            'reason': reason,
+        })
+        log.warning('связь отброшена (%s → %s): %s',
+                    from_name, to_name, reason)
+        return False
 
     def add_group(self, group_name, component_names):
         gid = _name_to_id(group_name)
@@ -416,12 +446,15 @@ CONNECTION_WORDS = {
 }
 
 
-def parse_passport(pdf_path):
-    """Main parsing function. Returns SystemModel."""
-    log.info("Parsing passport: %s", pdf_path)
+def parse_passport_text(pages, stem=''):
+    """Разобрать уже извлечённые страницы паспорта → SystemModel.
 
-    # 1. Extract text
-    pages = extract_text_all(pdf_path)
+    ``pages`` — список ``(номер_страницы, текст)``, как их отдаёт
+    :func:`passport_to_uml.sources.read_passport_source`.
+
+    Отделено от :func:`parse_passport`, чтобы правила разбора можно было
+    проверять без PDF и без pdfplumber (и прогнать паспорт в виде текста).
+    """
     if not pages:
         log.error("No text extracted")
         return None
@@ -434,7 +467,6 @@ def parse_passport(pdf_path):
 
     # 3. Build model
     model = SystemModel()
-    stem = Path(pdf_path).stem
     model.subtitle = stem
 
     # Find device title
@@ -724,6 +756,20 @@ def parse_passport(pdf_path):
     return model
 
 
+def parse_passport(path):
+    """Прочитать паспорт (PDF / текст / HTML) и вернуть SystemModel.
+
+    Бросает :class:`passport_to_uml.sources.InputNotFound` (нет файла)
+    или :class:`passport_to_uml.sources.TextExtractionError` (текст не извлечь).
+    """
+    from .sources import read_passport_source
+
+    log.info("Parsing passport: %s", path)
+    pages = read_passport_source(path)
+    stem = Path(path).stem
+    return parse_passport_text(pages, stem)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # DIAGRAM BUILDER — Graphviz DOT renderer
 # ──────────────────────────────────────────────────────────────────────
@@ -748,163 +794,288 @@ def _style_for_category(cat):
     return CATEGORY_STYLES.get(cat, CATEGORY_STYLES['accessory'])
 
 
-def build_diagram(model, output_stem=None):
-    """Build Graphviz diagram and render to PNG + PDF."""
-    import graphviz
+# ──────────────────────────────────────────────────────────────────────
+# ТАБЛИЦА СОСТАВА И DOT-ГРАФ — только stdlib, без Graphviz
+# ──────────────────────────────────────────────────────────────────────
+
+def _group_name_of(model, cid):
+    """Имя группы, в которую входит компонент (или пустая строка)."""
+    for gname, cids in model.groups.values():
+        if cid in cids:
+            return gname
+    return ''
+
+
+COMPONENT_COLUMNS = ('no', 'id', 'name', 'category', 'category_label',
+                     'group', 'refs', 'links', 'description')
+LINK_COLUMNS = ('no', 'from', 'to', 'label', 'status', 'reason')
+
+
+def spec_rows(model):
+    """Таблица состава: строка на каждый компонент модели."""
+    rows = []
+    for number, comp in enumerate(model.components.values(), 1):
+        refs = []
+        for ref in comp.refs:
+            if ref and ref not in refs:
+                refs.append(ref)
+        style = CATEGORY_STYLES.get(comp.category, CATEGORY_STYLES['accessory'])
+        rows.append({
+            'no': number,
+            'id': comp.id,
+            'name': comp.name,
+            'category': comp.category,
+            'category_label': style['label'],
+            'group': _group_name_of(model, comp.id),
+            'refs': ', '.join(refs),
+            'links': sum(1 for rel in model.relations
+                         if comp.id in (rel.from_id, rel.to_id)),
+            'description': comp.description,
+        })
+    return rows
+
+
+def link_rows(model):
+    """Связи модели: принятые рёбра и отброшенные (с причиной).
+
+    Отброшенные рёбра — это случай «в паспорте нет данных для ребра»:
+    система не теряет их молча, а показывает в таблице со статусом.
+    """
+    rows = []
+    for number, rel in enumerate(model.relations, 1):
+        frm = model.components.get(rel.from_id)
+        to = model.components.get(rel.to_id)
+        rows.append({
+            'no': number,
+            'from': frm.name if frm else rel.from_id,
+            'to': to.name if to else rel.to_id,
+            'label': rel.label,
+            'status': 'принята',
+            'reason': '',
+        })
+    for number, drop in enumerate(model.dropped_relations,
+                                  len(model.relations) + 1):
+        rows.append({
+            'no': number,
+            'from': drop['from'],
+            'to': drop['to'],
+            'label': drop.get('label', ''),
+            'status': 'отброшена',
+            'reason': drop.get('reason', ''),
+        })
+    return rows
+
+
+def _md_cell(value):
+    return str(value).replace('|', '\\|').replace('\n', ' ').strip()
+
+
+def _md_table(headers, rows):
+    lines = ['| ' + ' | '.join(headers) + ' |',
+             '|' + '|'.join('---' for _ in headers) + '|']
+    for row in rows:
+        lines.append('| ' + ' | '.join(_md_cell(cell) for cell in row) + ' |')
+    return '\n'.join(lines)
+
+
+def render_spec_markdown(model):
+    """Таблица состава + таблица связей в markdown."""
+    rows = spec_rows(model)
+    links = link_rows(model)
+    accepted = sum(1 for row in links if row['status'] == 'принята')
+    dropped = len(links) - accepted
+
+    parts = [
+        f'# Таблица состава — {model.title or "Функциональная схема"}',
+        '',
+        f'- источник: `{model.subtitle or "-"}`',
+        f'- компонентов: {len(rows)}',
+        f'- связей: {accepted} (отброшено: {dropped})',
+        f'- групп: {len(model.groups)}',
+        '',
+        f'## Компоненты ({len(rows)})',
+        '',
+        _md_table(('№', 'ID', 'Наименование', 'Категория', 'Группа',
+                   'Раздел(ы)', 'Связей', 'Описание'),
+                  [(r['no'], r['id'], r['name'], r['category_label'],
+                    r['group'], r['refs'], r['links'], r['description'])
+                   for r in rows]),
+        '',
+        f'## Связи ({accepted})',
+        '',
+        _md_table(('№', 'Откуда', 'Куда', 'Метка', 'Статус', 'Причина'),
+                  [(r['no'], r['from'], r['to'], r['label'],
+                    r['status'], r['reason'])
+                   for r in links]),
+        '',
+    ]
+
+    if model.flow_notes:
+        parts.append(f'## Потоки ({len(model.flow_notes)})')
+        parts.append('')
+        for note in model.flow_notes:
+            parts.append(f'- {note}')
+        parts.append('')
+
+    return '\n'.join(parts)
+
+
+def write_spec_table(model, output_stem):
+    """Записать таблицу состава: ``<stem>.spec.md``, ``<stem>.spec.csv``,
+    ``<stem>.links.csv`` (CSV в UTF-8 с BOM, разделитель «;»)."""
+    import csv
+
+    paths = {
+        'markdown': output_stem + '.spec.md',
+        'components_csv': output_stem + '.spec.csv',
+        'links_csv': output_stem + '.links.csv',
+    }
+
+    with open(paths['markdown'], 'w', encoding='utf-8') as fh:
+        fh.write(render_spec_markdown(model))
+
+    with open(paths['components_csv'], 'w', encoding='utf-8-sig',
+              newline='') as fh:
+        writer = csv.writer(fh, delimiter=';')
+        writer.writerow(COMPONENT_COLUMNS)
+        for row in spec_rows(model):
+            writer.writerow([row[key] for key in COMPONENT_COLUMNS])
+
+    with open(paths['links_csv'], 'w', encoding='utf-8-sig',
+              newline='') as fh:
+        writer = csv.writer(fh, delimiter=';')
+        writer.writerow(LINK_COLUMNS)
+        for row in link_rows(model):
+            writer.writerow([row[key] for key in LINK_COLUMNS])
+
+    return paths
+
+
+def render_dot(model):
+    """Собрать исходник Graphviz DOT из модели (stdlib, Graphviz не нужен).
+
+    Это единственный источник правды для графа: тот же текст пишется в
+    ``<stem>.dot`` и отдаётся Graphviz для рендера PNG/PDF.
+    """
+    def q(value):
+        return '"' + _sanitize(str(value)) + '"'
+
+    def node_attrs(comp):
+        style = _style_for_category(comp.category)
+        return (f'label={q(comp.name)}, fillcolor="{style["fill"]}", '
+                f'color="{style["color"]}", fontcolor="{style["color"]}", '
+                'shape="box", style="filled,rounded", penwidth="1.5"')
+
+    title = (model.title or 'Функциональная схема')
+    caption = f'{title}\\n{model.subtitle}' if model.subtitle else title
+    counters = (f'Компонентов: {len(model.components)}, '
+                f'связей: {len(model.relations)}')
+    if model.dropped_relations:
+        counters += f', отброшено: {len(model.dropped_relations)}'
+    label = caption + '\\n' + counters
+
+    lines = ['digraph functional_scheme {']
+    add = lines.append
+    add(f'  graph [label="{_sanitize(label)}", labelloc="t", fontsize="20", '
+        'fontname="Arial", bgcolor="#FAFAFA", dpi="200", rankdir="TB", '
+        'splines="true", pad="0.5", nodesep="0.5", ranksep="1.0", '
+        'compound="true"];')
+    add('  node [fontname="Arial", fontsize="9", shape="box", '
+        'style="filled,rounded", penwidth="1.5"];')
+    add('  edge [fontname="Arial", fontsize="7", penwidth="1.2"];')
+
+    grouped = set()
+    for gid, (gname, cids) in model.groups.items():
+        cids = [cid for cid in cids if cid in model.components]
+        if not cids:
+            continue
+        grouped.update(cids)
+        add(f'  subgraph {q("cluster_" + gid)} {{')
+        add(f'    label={q(gname)};')
+        add('    style="dashed"; color="#888888"; fontsize="14"; '
+            'fontname="Arial"; fontcolor="#555555"; penwidth="1.5"; margin="8";')
+        for cid in cids:
+            add(f'    {q(cid)} [{node_attrs(model.components[cid])}];')
+        add('  }')
+
+    # Компоненты вне групп показываем, только если у них есть связи.
+    shown = set(grouped)
+    for rel in model.relations:
+        for cid in (rel.from_id, rel.to_id):
+            if cid in model.components and cid not in shown:
+                shown.add(cid)
+                add(f'  {q(cid)} [{node_attrs(model.components[cid])}];')
+
+    for rel in model.relations:
+        if rel.from_id in model.components and rel.to_id in model.components:
+            label_attr = f'label={q(rel.label)}, ' if rel.label else ''
+            add(f'  {q(rel.from_id)} -> {q(rel.to_id)} [{label_attr}'
+                'color="#666666", fontcolor="#666666"];')
+
+    add(f'  subgraph {q("cluster_legend")} {{')
+    add('    label="Легенда"; style="dotted"; color="#BBBBBB"; fontsize="10"; '
+        'fontname="Arial"; fontcolor="#888888"; penwidth="0.5"; margin="10";')
+    for cat_key, cat_style in CATEGORY_STYLES.items():
+        if cat_key == 'accessory':
+            continue
+        add(f'    {q("legend_" + cat_key)} [label={q(cat_style["label"])}, '
+            f'fillcolor="{cat_style["fill"]}", '
+            f'color="{cat_style["color"]}", '
+            f'fontcolor="{cat_style["color"]}", shape="box", '
+            'style="filled", fontsize="8", width="1.2", height="0.2"];')
+    add('  }')
+    add('}')
+
+    return '\n'.join(lines) + '\n'
+
+
+def build_diagram(model, output_stem=None, render=True):
+    """Собрать граф: DOT (всегда) → PNG + PDF (Graphviz, если установлен).
+
+    Возвращает ``(png_path, pdf_path)``; если рендер недоступен или упал —
+    ``(None, None)``, но DOT и таблица состава всё равно остаются на диске,
+    чтобы граф не потерялся.
+    """
+    import tempfile
+    import shutil
 
     if output_stem is None:
         output_stem = 'diagram'
 
-    dot = graphviz.Digraph(
-        name='functional_scheme',
-        format='png',
-        engine='dot',
-        graph_attr={
-            'label': _sanitize(f'{model.title}\n{model.subtitle}'),
-            'labelloc': 't',
-            'fontsize': '24',
-            'fontname': 'Arial',
-            'bgcolor': '#FAFAFA',
-            'dpi': '200',
-            'rankdir': 'TB',
-            'splines': 'true',
-            'pad': '0.5',
-            'nodesep': '0.5',
-            'ranksep': '1.0',
-            'compound': 'true',
-        },
-        node_attr={
-            'fontname': 'Arial',
-            'fontsize': '9',
-            'shape': 'box',
-            'style': 'filled,rounded',
-            'penwidth': '1.5',
-        },
-        edge_attr={
-            'fontname': 'Arial',
-            'fontsize': '7',
-            'penwidth': '1.2',
-        }
-    )
+    dot_path = output_stem + '.dot'
+    dot_source = render_dot(model)
+    with open(dot_path, 'w', encoding='utf-8') as fh:
+        fh.write(dot_source)
+    log.info("DOT: %s", dot_path)
 
-    # Subsystems (groups) — put nodes INSIDE clusters
-    comp_to_group = {}
-    grouped_cids = set()
-    for gid, (gname, cids) in model.groups.items():
-        for cid in cids:
-            comp_to_group[cid] = gid
-            grouped_cids.add(cid)
-
-    # Build clusters
-    for gid, (gname, cids) in model.groups.items():
-        if not cids:
-            continue
-        with dot.subgraph(name=f'cluster_{gid}') as sub:
-            sub.attr(
-                label=_sanitize(gname),
-                style='dashed',
-                color='#888888',
-                fontsize='14',
-                fontname='Arial',
-                fontcolor='#555555',
-                penwidth='1.5',
-                margin='8',
-            )
-            for cid in cids:
-                if cid in model.components:
-                    comp = model.components[cid]
-                    style = _style_for_category(comp.category)
-                    sub.node(
-                        cid,
-                        label=_sanitize(comp.name),
-                        fillcolor=style['fill'],
-                        color=style['color'],
-                        fontcolor=style['color'],
-                        shape='box',
-                        style='filled,rounded',
-                        penwidth='1.5',
-                    )
-
-    # Ungrouped but connected components
-    shown_cids = set(grouped_cids)
-    for rel in model.relations:
-        for cid in (rel.from_id, rel.to_id):
-            if cid in model.components and cid not in shown_cids:
-                shown_cids.add(cid)
-                comp = model.components[cid]
-                style = _style_for_category(comp.category)
-                is_external = comp.category in ('external', 'airflow')
-                dot.node(
-                    cid,
-                    label=_sanitize(comp.name),
-                    fillcolor=style['fill'],
-                    color=style['color'],
-                    fontcolor=style['color'],
-                    style='dashed' if is_external else 'filled,rounded',
-                    penwidth='1.0' if is_external else '1.5',
-                )
-
-    # Ungrouped components shown outside clusters (only connected ones)
-
-    # Connections
-    for rel in model.relations:
-        if rel.from_id in model.components and rel.to_id in model.components:
-            dot.edge(
-                rel.from_id, rel.to_id,
-                label=_sanitize(rel.label) if rel.label else '',
-                color='#666666',
-                fontcolor='#666666',
-            )
-
-    # Legend
-    with dot.subgraph(name='cluster_legend') as legend:
-        legend.attr(
-            label='Легенда',
-            style='dotted',
-            color='#BBBBBB',
-            fontsize='10',
-            fontname='Arial',
-            fontcolor='#888888',
-            penwidth='0.5',
-            margin='10',
-        )
-        for cat_key, cat_style in CATEGORY_STYLES.items():
-            if cat_key == 'accessory':
-                continue
-            lid = f'legend_{cat_key}'
-            legend.node(
-                lid,
-                label=cat_style['label'],
-                fillcolor=cat_style['fill'],
-                color=cat_style['color'],
-                fontcolor=cat_style['color'],
-                shape='box',
-                style='filled',
-                fontsize='8',
-                width='1.2',
-                height='0.2',
-            )
-
-    # Render
-    try:
-        dot.save(output_stem + '.dot')
-        log.info("DOT saved to %s.dot", output_stem)
-        png_result = dot.render(filename=output_stem, format='png', cleanup=False)
-        log.info("PNG: %s", png_result)
-        pdf_result = dot.render(filename=output_stem, format='pdf', cleanup=False)
-        log.info("PDF: %s", pdf_result)
-        png_path = output_stem + '.png'
-        pdf_path = output_stem + '.pdf'
-        log.info("Diagram: %s, %s", png_path, pdf_path)
-        return png_path, pdf_path
-    except Exception as e:
-        log.error("Render failed: %s", e)
-        try:
-            dot.save(output_stem + '.dot')
-            log.info("DOT saved to %s.dot", output_stem)
-        except Exception:
-            pass
+    if not render:
+        log.info("Рендер отключён: PNG/PDF не строятся")
         return None, None
+
+    try:
+        import graphviz
+    except ImportError as exc:
+        log.error("Нет python-модуля graphviz (%s): PNG/PDF не построены, "
+                  "DOT сохранён в %s", exc, dot_path)
+        return None, None
+
+    try:
+        source = graphviz.Source(dot_source, engine='dot')
+        with tempfile.TemporaryDirectory(prefix='passport_uml_render_') as tmp:
+            for fmt in ('png', 'pdf'):
+                produced = source.render(
+                    filename=os.path.join(tmp, 'diagram'),
+                    format=fmt, cleanup=True)
+                shutil.move(produced, f'{output_stem}.{fmt}')
+    except Exception as exc:
+        log.error("Рендер не выполнен (%s: %s): DOT сохранён в %s",
+                  type(exc).__name__, exc, dot_path)
+        return None, None
+
+    png_path = output_stem + '.png'
+    pdf_path = output_stem + '.pdf'
+    log.info("Диаграмма: %s, %s", png_path, pdf_path)
+    return png_path, pdf_path
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1291,41 +1462,130 @@ def export_png_pdf(model, output_stem=None, verbose=False):
     return build_diagram(model, output_stem)
 
 
-def main():
-    """CLI entry point."""
+# Коды возврата CLI — контракт, который проверяют тесты и CI.
+EXIT_OK = 0
+EXIT_INPUT_MISSING = 1
+EXIT_USAGE = 2          # argparse отдаёт его сам
+EXIT_NO_TEXT = 3
+EXIT_RENDER_FAILED = 4
+
+EXIT_CODES_HELP = """\
+коды возврата:
+  0  успех: DOT + таблица состава (+ PNG/PDF, если рендер прошёл или задан --no-render)
+  1  входной файл не найден или недоступен для чтения
+  2  ошибка в аргументах командной строки
+  3  текст из паспорта не извлечён (нет текстового слоя / битый файл / нет pdfplumber)
+  4  рендер PNG/PDF не выполнен — DOT и таблица состава всё равно записаны
+
+выходные файлы (по умолчанию рядом с текущим каталогом, префикс — имя входа):
+  <stem>.dot        граф связей в формате Graphviz DOT (пишется всегда)
+  <stem>.spec.md    таблица состава + таблица связей (markdown)
+  <stem>.spec.csv   таблица состава (CSV, UTF-8 BOM, разделитель «;»)
+  <stem>.links.csv  связи, включая отброшенные (статус + причина)
+  <stem>.png/.pdf   диаграмма (только если доступен Graphviz)
+"""
+
+
+def run_cli(argv=None, stdout=None, stderr=None):
+    """Паспорт → граф связей (DOT) → диаграмма (PNG/PDF) + таблица состава.
+
+    Возвращает код возврата вместо завершения процесса: контракт проверяется
+    тестами без subprocess.
+    """
     import argparse
+    from .sources import (InputNotFound, PassportSourceError,
+                          TextExtractionError, read_passport_source)
+
+    out = stdout or sys.stdout
+    err = stderr or sys.stderr
 
     parser = argparse.ArgumentParser(
-        description='passport-to-uml — Extract functional diagram from passport PDF',
+        prog='passport-to-uml',
+        description='passport-to-uml — паспорт → граф связей → '
+                    'диаграмма и таблица состава',
+        epilog=EXIT_CODES_HELP,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('input', help='Passport PDF path')
+    parser.add_argument('input',
+                        help='паспорт: .pdf (нужен pdfplumber), .txt или .html')
     parser.add_argument('output', nargs='?', default=None,
-                        help='Output stem (without extension)')
+                        help='префикс выходных файлов (без расширения)')
+    parser.add_argument('--outdir', default=None,
+                        help='каталог для выходных файлов (по умолчанию — текущий)')
+    parser.add_argument('--no-render', action='store_true',
+                        help='не вызывать Graphviz: только DOT и таблица состава')
     parser.add_argument('--verbose', '-v', action='store_true')
+    parser.add_argument('--quiet', '-q', action='store_true',
+                        help='не печатать сводку')
 
-    args = parser.parse_args()
-
-    if not os.path.exists(args.input):
-        print(f"Error: file not found: {args.input}")
-        sys.exit(1)
+    args = parser.parse_args(argv)
 
     if args.verbose:
         logging.basicConfig(level=logging.INFO, format='%(message)s')
     else:
         logging.basicConfig(level=logging.WARNING)
 
-    model = parse_passport(args.input)
-    if not model:
-        print("Error: could not parse passport")
-        sys.exit(1)
+    try:
+        pages = read_passport_source(args.input)
+    except InputNotFound as exc:
+        print(f'Ошибка: {exc}', file=err)
+        return EXIT_INPUT_MISSING
+    except TextExtractionError as exc:
+        print(f'Ошибка: {exc}', file=err)
+        return EXIT_NO_TEXT
+    except PassportSourceError as exc:  # pragma: no cover - страховка
+        print(f'Ошибка: {exc}', file=err)
+        return EXIT_NO_TEXT
 
-    output = args.output or 'uml_diagram'
-    png, pdf = build_diagram(model, output)
-    if png:
-        print(f"OK: {png}, {pdf}")
+    outdir = args.outdir or '.'
+    os.makedirs(outdir, exist_ok=True)
+    input_stem = os.path.splitext(os.path.basename(args.input))[0]
+    stem_arg = args.output or input_stem
+    if os.path.dirname(stem_arg):
+        output_stem = stem_arg            # явный путь: --outdir не применяется
     else:
-        print(f"Warning: rendering failed, DOT saved to {output}.dot")
+        output_stem = os.path.join(outdir, stem_arg)
+
+    model = parse_passport_text(pages, input_stem)
+    if model is None or not model.components:
+        print(f'Ошибка: из паспорта не выделено ни одного компонента: '
+              f'{args.input}', file=err)
+        return EXIT_NO_TEXT
+
+    spec_paths = write_spec_table(model, output_stem)
+    png, pdf = build_diagram(model, output_stem, render=not args.no_render)
+
+    if not args.quiet:
+        print(f'passport-to-uml {__version__}', file=out)
+        print(f'Вход: {args.input} ({len(pages)} стр., '
+              f'{sum(len(text) for _, text in pages)} символов)', file=out)
+        print(f'Компонентов: {len(model.components)} | '
+              f'связей: {len(model.relations)} '
+              f'(отброшено: {len(model.dropped_relations)}) | '
+              f'групп: {len(model.groups)}', file=out)
+        print(f'Граф (DOT): {output_stem}.dot', file=out)
+        print(f'Таблица состава: {spec_paths["markdown"]} '
+              f'(CSV: {spec_paths["components_csv"]}, '
+              f'{spec_paths["links_csv"]})', file=out)
+        if png and pdf:
+            print(f'Диаграмма: {png}, {pdf}', file=out)
+        elif args.no_render:
+            print('Диаграмма: не строилась (--no-render)', file=out)
+        else:
+            print(f'Диаграмма: не построена — Graphviz недоступен или упал; '
+                  f'DOT сохранён в {output_stem}.dot', file=out)
+
+    if png and pdf:
+        return EXIT_OK
+    if args.no_render:
+        return EXIT_OK
+    return EXIT_RENDER_FAILED
+
+
+def main(argv=None):
+    """Точка входа CLI. Возвращает код возврата (см. EXIT_CODES_HELP)."""
+    return run_cli(argv)
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
+
