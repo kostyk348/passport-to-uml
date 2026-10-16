@@ -1,5 +1,10 @@
 # passport-to-uml
 
+[![CI](https://github.com/kostyk348/passport-to-uml/actions/workflows/tests.yml/badge.svg)](https://github.com/kostyk348/passport-to-uml/actions/workflows/tests.yml)
+[![Release](https://img.shields.io/github/v/release/kostyk348/passport-to-uml?sort=semver&color=blue)](https://github.com/kostyk348/passport-to-uml/releases)
+[![License](https://img.shields.io/badge/license-Apache-2.0-green)](https://github.com/kostyk348/passport-to-uml/blob/master/LICENSE)
+[![Last commit](https://img.shields.io/github/last-commit/kostyk348/passport-to-uml?branch=master)](https://github.com/kostyk348/passport-to-uml/commits/master)
+
 **Extract functional UML component diagrams from technical passport PDFs.**
 
 Parses technical documentation (ГОСТ, ТУ, паспорта изделий), extracts
@@ -52,6 +57,7 @@ Extract components, connections, control flow
 ```
 
 ### Diagram features
+
 - Color-coded categories (airflow, hydronic, control, electrical, etc.)
 - Logical grouping by subsystem (clusters with dashed borders)
 - Labeled connections with flow direction
@@ -72,6 +78,7 @@ pip install -e .
 #   Windows: winget install Graphviz.Graphviz
 #   Linux:   apt install graphviz
 #   macOS:   brew install graphviz
+
 ```
 
 Граф DOT и таблица состава строятся **без** Graphviz — он нужен только
@@ -83,6 +90,7 @@ pip install -e .
 
 ```bash
 # Паспорт → граф связей + таблица состава (+ диаграмма, если есть Graphviz)
+
 python -m passport_to_uml input.pdf [output_prefix] [--outdir DIR]
                                              [--no-render] [-v] [-q]
 ```
@@ -182,9 +190,11 @@ python -m unittest discover -s tests -t . -v
 
 ```bash
 # вариант 1: прямо по текстовым фикстурам (без pdfplumber)
+
 python check_passports.py examples/passports/*.txt --outdir out
 
 # вариант 2: как с настоящими документами — через PDF
+
 python examples/build_passport_pdfs.py                 # нужен LibreOffice
 python check_passports.py examples/passports/pdf/*.pdf --outdir out   # нужен pdfplumber
 ```
