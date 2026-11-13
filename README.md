@@ -1,11 +1,20 @@
+<div align="center">
+
+<img src="docs/banner.svg" alt="passport-to-uml banner" width="1000">
+
 # passport-to-uml
+
+### Extract functional UML component diagrams from technical passport PDFs.
 
 [![CI](https://github.com/kostyk348/passport-to-uml/actions/workflows/tests.yml/badge.svg)](https://github.com/kostyk348/passport-to-uml/actions/workflows/tests.yml)
 [![Release](https://img.shields.io/github/v/release/kostyk348/passport-to-uml?sort=semver&color=blue)](https://github.com/kostyk348/passport-to-uml/releases)
 [![License](https://img.shields.io/badge/license-Apache-2.0-green)](https://github.com/kostyk348/passport-to-uml/blob/master/LICENSE)
 [![Last commit](https://img.shields.io/github/last-commit/kostyk348/passport-to-uml?branch=master)](https://github.com/kostyk348/passport-to-uml/commits/master)
 
-**Extract functional UML component diagrams from technical passport PDFs.**
+</div>
+
+---
+
 
 Parses technical documentation (ГОСТ, ТУ, паспорта изделий), extracts
 components, connections, and control logic, then renders a colored
